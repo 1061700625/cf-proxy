@@ -16,11 +16,29 @@ const DEFAULT_USER_AGENT =
   "AppleWebKit/537.36 (KHTML, like Gecko) " +
   "Chrome/110.0.0.0 Safari/537.36";
 
+const CSS_REWRITE_MAX_BYTES = 512 * 1024;
+
 const STRIPPED_HEADERS = [
   "cf-connecting-ip",
   "cf-ipcountry",
+  "cf-ray",
+  "cf-visitor",
+  "cf-worker",
+  "true-client-ip",
   "x-forwarded-for",
   "x-real-ip",
+];
+
+const HOP_BY_HOP_HEADERS = [
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
 ];
 
 const REWRITE_ATTRIBUTES = {
@@ -47,9 +65,11 @@ const CORS_HEADERS = {
 const HTML_SELECTOR =
   "a, img, link, script, form, iframe, source, video, audio, input";
 
-addEventListener("fetch", (event) => {
-  event.respondWith(handleRequest(event.request));
-});
+if (typeof addEventListener === "function") {
+  addEventListener("fetch", (event) => {
+    event.respondWith(handleRequest(event.request));
+  });
+}
 
 
 /**
@@ -113,6 +133,10 @@ async function handleRequest(request) {
     return textResponse("CF-Proxy is running");
   }
 
+  if (requestUrl.pathname === "/robots.txt") {
+    return textResponse("User-agent: *\nDisallow: /\n");
+  }
+
   try {
     /*
      * 优先处理浏览器产生的相对路径请求。
@@ -160,7 +184,7 @@ async function handleRequest(request) {
       }
     }
 
-    return buildResponse(
+    return await buildResponse(
       response,
       requestUrl.origin,
       targetUrl,
@@ -266,6 +290,7 @@ function resolveRefererTarget(
  */
 async function fetchTarget(request, targetUrl) {
   const headers = new Headers(request.headers);
+  stripHopByHopHeaders(headers);
 
   // Host 由 fetch 根据 targetUrl 自动生成。
   headers.set("Referer", targetUrl.origin);
@@ -298,7 +323,7 @@ async function fetchTarget(request, targetUrl) {
         `Bearer ${token}`,
       );
     }
-  } else if (!headers.has("User-Agent")) {
+  } else if (!headerValue(headers, "User-Agent")) {
     headers.set(
       "User-Agent",
       DEFAULT_USER_AGENT,
@@ -376,7 +401,7 @@ function rewriteRedirect(
 /**
  * 构造代理响应，并对 HTML 做链接重写。
  */
-function buildResponse(
+async function buildResponse(
   response,
   proxyOrigin,
   targetUrl,
@@ -384,6 +409,11 @@ function buildResponse(
   const headers =
     new Headers(response.headers);
 
+  rewriteSetCookieHeaders(
+    headers,
+    proxyOrigin,
+    targetUrl,
+  );
   applyCors(headers);
 
   /*
@@ -410,6 +440,18 @@ function buildResponse(
 
   const contentType =
     headers.get("Content-Type") || "";
+
+  if (
+    contentType
+      .toLowerCase()
+      .includes("text/css")
+  ) {
+    return rewriteCssResponse(
+      result,
+      proxyOrigin,
+      targetUrl,
+    );
+  }
 
   if (
     !contentType
@@ -539,6 +581,321 @@ function proxyUrl(origin, targetUrl) {
 }
 
 
+function stripHopByHopHeaders(headers) {
+  const connection =
+    headers.get("Connection");
+
+  for (const name of HOP_BY_HOP_HEADERS) {
+    headers.delete(name);
+  }
+
+  if (!connection) {
+    return;
+  }
+
+  for (const token of connection.split(",")) {
+    const name = token.trim();
+
+    if (name) {
+      headers.delete(name);
+    }
+  }
+}
+
+
+function rewriteSetCookieHeaders(
+  headers,
+  proxyOrigin,
+  targetUrl,
+) {
+  const rawCookies =
+    readSetCookies(headers);
+
+  if (!rawCookies.length) {
+    return;
+  }
+
+  headers.delete("Set-Cookie");
+
+  for (const cookie of rawCookies) {
+    headers.append(
+      "Set-Cookie",
+      rewriteSetCookie(
+        cookie,
+        proxyOrigin,
+        targetUrl,
+      ),
+    );
+  }
+}
+
+
+function readSetCookies(headers) {
+  /*
+   * Workers 运行时支持 getSetCookie() 时优先使用，
+   * 避免多 Set-Cookie 被错误合并。
+   */
+  if (typeof headers.getSetCookie === "function") {
+    const cookies =
+      headers.getSetCookie();
+
+    if (Array.isArray(cookies)) {
+      return cookies.filter(Boolean);
+    }
+  }
+
+  const combined =
+    headers.get("Set-Cookie");
+
+  if (!combined) {
+    return [];
+  }
+
+  return splitSetCookieHeader(combined);
+}
+
+
+function splitSetCookieHeader(value) {
+  const cookies = [];
+  let start = 0;
+  let inExpires = false;
+
+  for (let i = 0; i < value.length; i++) {
+    const next =
+      value.slice(i, i + 8).toLowerCase();
+
+    if (next === "expires=") {
+      inExpires = true;
+      i += 7;
+      continue;
+    }
+
+    const char = value[i];
+
+    if (inExpires && char === ";") {
+      inExpires = false;
+      continue;
+    }
+
+    if (char === "," && !inExpires) {
+      const cookie =
+        value.slice(start, i).trim();
+
+      if (cookie) {
+        cookies.push(cookie);
+      }
+
+      start = i + 1;
+    }
+  }
+
+  const last =
+    value.slice(start).trim();
+
+  if (last) {
+    cookies.push(last);
+  }
+
+  return cookies;
+}
+
+
+function rewriteSetCookie(
+  cookie,
+  proxyOrigin,
+  targetUrl,
+) {
+  const parts =
+    cookie.split(";");
+  const nameValue =
+    parts.shift();
+
+  if (!nameValue || !nameValue.includes("=")) {
+    return cookie;
+  }
+
+  let hasPath = false;
+  let hasDomain = false;
+  const attributes = [];
+
+  for (const rawPart of parts) {
+    const part = rawPart.trim();
+
+    if (!part) {
+      continue;
+    }
+
+    const equalIndex =
+      part.indexOf("=");
+    const key = (
+      equalIndex === -1
+        ? part
+        : part.slice(0, equalIndex)
+    ).trim()
+      .toLowerCase();
+    const value =
+      equalIndex === -1
+        ? ""
+        : part.slice(equalIndex + 1).trim();
+
+    if (key === "path") {
+      hasPath = true;
+      attributes.push(
+        `Path=${proxyCookiePath(
+          targetUrl,
+          normalizeCookiePath(value),
+        )}`,
+      );
+      continue;
+    }
+
+    if (key === "domain") {
+      hasDomain = true;
+      continue;
+    }
+
+    attributes.push(part);
+  }
+
+  if (!hasPath) {
+    attributes.push(
+      `Path=${proxyCookiePath(
+        targetUrl,
+        defaultCookiePath(
+          targetUrl.pathname,
+        ),
+      )}`,
+    );
+  }
+
+  if (hasDomain) {
+    attributes.push(
+      `Domain=${new URL(proxyOrigin).hostname}`,
+    );
+  }
+
+  return [
+    nameValue.trim(),
+    ...attributes,
+  ].join("; ");
+}
+
+
+function defaultCookiePath(pathname) {
+  if (!pathname || pathname === "/") {
+    return "/";
+  }
+
+  const lastSlash =
+    pathname.lastIndexOf("/");
+
+  if (lastSlash <= 0) {
+    return "/";
+  }
+
+  return pathname.slice(0, lastSlash);
+}
+
+
+function normalizeCookiePath(path) {
+  if (!path || path[0] !== "/") {
+    return "/";
+  }
+
+  return path;
+}
+
+
+function proxyCookiePath(targetUrl, path) {
+  return `/${targetUrl.protocol}//${targetUrl.host}${path}`;
+}
+
+
+async function rewriteCssResponse(
+  response,
+  proxyOrigin,
+  targetUrl,
+) {
+  const lengthHeader =
+    response.headers.get("Content-Length");
+  const contentLength =
+    lengthHeader === null
+      ? Number.NaN
+      : Number(lengthHeader);
+
+  if (
+    !Number.isFinite(contentLength) ||
+    contentLength > CSS_REWRITE_MAX_BYTES
+  ) {
+    return response;
+  }
+
+  const cssText =
+    await response.text();
+  const rewritten =
+    rewriteCssUrls(
+      cssText,
+      proxyOrigin,
+      targetUrl,
+    );
+  const headers =
+    new Headers(response.headers);
+
+  headers.delete("Content-Length");
+
+  return new Response(rewritten, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+
+function rewriteCssUrls(
+  cssText,
+  proxyOrigin,
+  baseUrl,
+) {
+  return cssText.replace(
+    /url\(\s*(["']?)([^"'()]+)\1\s*\)/gi,
+    (match, quote, rawValue) => {
+      const value = rawValue.trim();
+
+      if (
+        !value ||
+        value.startsWith("#") ||
+        /^(?:data|blob|about|javascript):/i.test(
+          value,
+        )
+      ) {
+        return match;
+      }
+
+      try {
+        const url = new URL(
+          value,
+          baseUrl,
+        );
+
+        if (
+          !isHttpUrl(url) ||
+          url.origin === proxyOrigin
+        ) {
+          return match;
+        }
+
+        return `url(${quote}${proxyUrl(
+          proxyOrigin,
+          url,
+        )}${quote})`;
+      } catch {
+        return match;
+      }
+    },
+  );
+}
+
+
 function parseHttpUrl(value) {
   try {
     const url = new URL(value);
@@ -580,6 +937,17 @@ function getGithubToken() {
 }
 
 
+function headerValue(headers, name) {
+  const value = headers.get(name);
+  return (
+    typeof value === "string" &&
+    value.trim()
+  )
+    ? value.trim()
+    : "";
+}
+
+
 function textResponse(
   message,
   status = 200,
@@ -599,4 +967,18 @@ function errorMessage(error) {
   return error instanceof Error
     ? error.message
     : String(error);
+}
+
+
+if (typeof module !== "undefined") {
+  module.exports = {
+    CSS_REWRITE_MAX_BYTES,
+    defaultCookiePath,
+    handleRequest,
+    proxyCookiePath,
+    rewriteCssUrls,
+    rewriteSetCookie,
+    splitSetCookieHeader,
+    stripHopByHopHeaders,
+  };
 }
