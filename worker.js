@@ -287,10 +287,6 @@ async function fetchTarget(request, targetUrl) {
   const headers = new Headers(request.headers);
   stripHopByHopHeaders(headers);
 
-  // 不把客户端凭证转发给任意代理目标。
-  headers.delete("Authorization");
-  headers.delete("Cookie");
-
   // Host 由 fetch 根据 targetUrl 自动生成。
   headers.set("Referer", targetUrl.origin);
   headers.set("Origin", targetUrl.origin);
