@@ -1,8 +1,3 @@
-const GITHUB_HOSTS = new Set([
-  "api.github.com",
-  "uploads.github.com",
-]);
-
 const REDIRECT_CODES = new Set([
   301,
   302,
@@ -292,6 +287,10 @@ async function fetchTarget(request, targetUrl) {
   const headers = new Headers(request.headers);
   stripHopByHopHeaders(headers);
 
+  // 不把客户端凭证转发给任意代理目标。
+  headers.delete("Authorization");
+  headers.delete("Cookie");
+
   // Host 由 fetch 根据 targetUrl 自动生成。
   headers.set("Referer", targetUrl.origin);
   headers.set("Origin", targetUrl.origin);
@@ -300,30 +299,7 @@ async function fetchTarget(request, targetUrl) {
     headers.delete(name);
   }
 
-  /*
-   * 保持原项目行为。
-   *
-   * GitHub API 总是提供稳定的 UA，
-   * 并仅向白名单 GitHub 主机注入 Token。
-   */
-  if (
-    targetUrl.protocol === "https:" &&
-    GITHUB_HOSTS.has(targetUrl.hostname)
-  ) {
-    headers.set(
-      "User-Agent",
-      DEFAULT_USER_AGENT,
-    );
-
-    const token = getGithubToken();
-
-    if (token) {
-      headers.set(
-        "Authorization",
-        `Bearer ${token}`,
-      );
-    }
-  } else if (!headerValue(headers, "User-Agent")) {
+  if (!headerValue(headers, "User-Agent")) {
     headers.set(
       "User-Agent",
       DEFAULT_USER_AGENT,
@@ -921,19 +897,6 @@ function applyCors(headers) {
   ) {
     headers.set(name, value);
   }
-}
-
-
-function getGithubToken() {
-  const token =
-    globalThis.GH_TOKEN;
-
-  return (
-    typeof token === "string" &&
-    token.trim()
-  )
-    ? token.trim()
-    : null;
 }
 
 
